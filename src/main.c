@@ -1,91 +1,243 @@
 /*
- * Copyright (c) 2016 Intel Corporation
+ * Copyright (c) 2018 Nordic Semiconductor ASA
  *
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
-#include <zephyr/kernel.h>
-#include <zephyr/device.h>
-#include <zephyr/devicetree.h>
-#include <zephyr/drivers/gpio.h>
+#include <zephyr/types.h>
+#include <stddef.h>
+#include <string.h>
+#include <errno.h>
 #include <zephyr/sys/printk.h>
-/* STEP 4 - Include the header file of the logger module */
-#include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/gpio.h>
+#include <soc.h>
 
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
 
-#define MAX_NUMBER_FACT 10
-#define SLEEP_TIME_MS   10*60*1000
+#include <bluetooth/services/lbs.h>
 
-#define SW0_NODE	DT_ALIAS(sw0)
-static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
+#include <zephyr/settings/settings.h>
 
-#define LED0_NODE DT_ALIAS(led0)
-static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+#include <dk_buttons_and_leds.h>
 
-/* STEP 5 - Register your code with the logger */
-LOG_MODULE_REGISTER(git_practice,LOG_LEVEL_DBG);
+#define DEVICE_NAME CONFIG_BT_DEVICE_NAME
+#define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
+#define RUN_STATUS_LED DK_LED1
+#define CON_STATUS_LED DK_LED2
+#define RUN_LED_BLINK_INTERVAL 1000
 
-/* STEP 7 - Replace the callback function button_pressed() */
-void button_pressed(const struct device *dev, struct gpio_callback *cb,
-            uint32_t pins)
+#define USER_LED DK_LED3
+
+#define USER_BUTTON DK_BTN1_MSK
+
+static bool app_button_state;
+
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+};
+
+static const struct bt_data sd[] = {
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
+};
+
+static void connected(struct bt_conn *conn, uint8_t err)
 {
-  int i;
-  int j;
-  long int factorial;
-  LOG_INF("Calculating the factorials of numbers 1 to %d:",MAX_NUMBER_FACT);
-  for (i=1;i<=MAX_NUMBER_FACT;i++){
-       factorial =1;
-        for (j=1;j<=i;j++){
-            factorial = factorial*j;
-        }
-        LOG_INF("The factorial of %2d = %ld",i,factorial);
-  }
-  /*Important note! 
-  Code in ISR runs at a high priority, therefore, it should be written with timing in mind.
-  Too lengthy or too complex tasks should not be performed by an ISR, they should be deferred to a thread 
-  */
+	if (err) {
+		printk("Connection failed (err %u)\n", err);
+		return;
+	}
+
+	printk("Connected\n");
+
+	dk_set_led_on(CON_STATUS_LED);
 }
 
-static struct gpio_callback button_cb_data;
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	printk("Disconnected (reason %u)\n", reason);
+
+	dk_set_led_off(CON_STATUS_LED);
+}
+
+#ifdef CONFIG_BT_LBS_SECURITY_ENABLED
+static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	if (!err) {
+		printk("Security changed: %s level %u\n", addr, level);
+	} else {
+		printk("Security failed: %s level %u err %d\n", addr, level, err);
+	}
+}
+#endif
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected = connected,
+	.disconnected = disconnected,
+#ifdef CONFIG_BT_LBS_SECURITY_ENABLED
+	.security_changed = security_changed,
+#endif
+};
+
+#if defined(CONFIG_BT_LBS_SECURITY_ENABLED)
+static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	printk("Passkey for %s: %06u\n", addr, passkey);
+}
+
+static void auth_cancel(struct bt_conn *conn)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	printk("Pairing cancelled: %s\n", addr);
+}
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	printk("Pairing completed: %s, bonded: %d\n", addr, bonded);
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	printk("Pairing failed conn: %s, reason %d\n", addr, reason);
+}
+
+static struct bt_conn_auth_cb conn_auth_callbacks = {
+	.passkey_display = auth_passkey_display,
+	.cancel = auth_cancel,
+};
+
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks = { .pairing_complete =
+									pairing_complete,
+								.pairing_failed = pairing_failed };
+#else
+static struct bt_conn_auth_cb conn_auth_callbacks;
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
+#endif
+
+static void app_led_cb(bool led_state)
+{
+	dk_set_led(USER_LED, led_state);
+}
+
+static bool app_button_cb(void)
+{
+	return app_button_state;
+}
+
+static struct bt_lbs_cb lbs_callbacs = {
+	.led_cb = app_led_cb,
+	.button_cb = app_button_cb,
+};
+
+static void button_changed(uint32_t button_state, uint32_t has_changed)
+{
+	if (has_changed & USER_BUTTON) {
+		uint32_t user_button_state = button_state & USER_BUTTON;
+
+		bt_lbs_send_button_state(user_button_state);
+		app_button_state = user_button_state ? true : false;
+	}
+}
+
+static int init_button(void)
+{
+	int err;
+
+	err = dk_buttons_init(button_changed);
+	if (err) {
+		printk("Cannot init buttons (err: %d)\n", err);
+	}
+
+	return err;
+}
 
 void main(void)
 {
-	int ret;
-	/* STEP 6 - Write some logs */
-    int exercise_num=2;
-    uint8_t data[] = {0x00, 0x01, 0x02, 0x03,
-                      0x04, 0x05, 0x06, 0x07,
-                      'H', 'e', 'l', 'l','o'};
-    //Printf-like messages
-    LOG_INF("nRF Connect SDK Fundamentals");
-    LOG_INF("Exercise %d",exercise_num);    
-    LOG_DBG("A log message in debug level");
-    LOG_WRN("A log message in warning level!");
-    LOG_ERR("A log message in Error level!");
-    //Hexdump some data
-    LOG_HEXDUMP_INF(data, sizeof(data),"Sample Data!"); 
+	int blink_status = 0;
+	int err;
 
-	/* Only checking one since led.port and button.port point to the same device, &gpio0 */
-	if (!device_is_ready(led.port)) {
+	printk("Starting Bluetooth Peripheral LBS example\n");
+
+	err = dk_leds_init();
+	if (err) {
+		printk("LEDs init failed (err %d)\n", err);
 		return;
 	}
 
-	ret = gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
-	if (ret < 0) {
+	err = init_button();
+	if (err) {
+		printk("Button init failed (err %d)\n", err);
 		return;
 	}
 
-	ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
-	if (ret < 0) {
+	if (IS_ENABLED(CONFIG_BT_LBS_SECURITY_ENABLED)) {
+		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+		if (err) {
+			printk("Failed to register authorization callbacks.\n");
+			return;
+		}
+
+		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+		if (err) {
+			printk("Failed to register authorization info callbacks.\n");
+			return;
+		}
 	}
 
-	ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+	err = bt_enable(NULL);
+	if (err) {
+		printk("Bluetooth init failed (err %d)\n", err);
+		return;
+	}
 
-	gpio_init_callback(&button_cb_data, button_pressed, BIT(button.pin));	
+	printk("Bluetooth initialized\n");
 
-	gpio_add_callback(button.port, &button_cb_data);
-	while (1) {
-        k_msleep(SLEEP_TIME_MS); 
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		settings_load();
+	}
+
+	err = bt_lbs_init(&lbs_callbacs);
+	if (err) {
+		printk("Failed to init LBS (err:%d)\n", err);
+		return;
+	}
+
+	err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+	if (err) {
+		printk("Advertising failed to start (err %d)\n", err);
+		return;
+	}
+
+	printk("Advertising successfully started\n");
+
+	for (;;) {
+		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
+		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
 	}
 }
